@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FASTQ 混样拆分</title>
+<style>
+  :root {
+    --bg: #f5f7fa; --card: #fff; --line: #d9dee6; --text: #1f2933;
+    --muted: #6b7280; --blue: #2563eb; --red: #dc2626; --green: #15803d;
+    --amber: #b45309;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { background: #0f172a; color: #fff; padding: 18px 28px; }
+  header h1 { margin: 0; font-size: 20px; }
+  header p { margin: 6px 0 0; font-size: 13px; color: #cbd5e1; }
+  main { max-width: 1080px; margin: 24px auto; padding: 0 20px; display: grid;
+         grid-template-columns: 420px 1fr; gap: 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 20px; }
+  .card h2 { margin: 0 0 14px; font-size: 16px; }
+  label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 4px; }
+  input[type=file] { width: 100%; font-size: 13px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  button { cursor: pointer; border: 0; border-radius: 8px; padding: 9px 16px;
+           font-size: 14px; font-weight: 600; }
+  button.primary { background: var(--blue); color: #fff; width: 100%; margin-top: 18px; }
+  button.primary:disabled { background: #93b4f5; cursor: not-allowed; }
+  button.danger { background: var(--red); color: #fff; padding: 5px 12px; font-size: 12px; }
+  button.download { background: var(--green); color: #fff; padding: 5px 12px; font-size: 12px; }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px;
+           font-weight: 700; }
+  .badge.running { background: #dbeafe; color: #1d4ed8; }
+  .badge.completed { background: #dcfce7; color: var(--green); }
+  .badge.failed { background: #fee2e2; color: var(--red); }
+  .badge.cancelled { background: #fef3c7; color: var(--amber); }
+  .error { color: var(--red); font-size: 12px; word-break: break-all; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  #formMsg { margin-top: 10px; font-size: 13px; min-height: 18px; }
+  .counts { font-size: 12px; color: #374151; }
+  .empty { color: var(--muted); font-size: 13px; padding: 14px 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>FASTQ 混样拆分服务</h1>
+  <p>上传 R1 / R2 / I1 / I2 四行制 FASTQ.gz 与 sample_id,i7,i5 样本表 · 最多 {{ max_parallel }} 批并行 · 状态仅存内存</p>
+</header>
+<main>
+  <section class="card">
+    <h2>新建拆分作业</h2>
+    <form id="jobForm">
+      <label>R1（read 1, FASTQ.gz）</label>
+      <input type="file" name="R1" accept=".gz,.fastq.gz,.fq.gz" required>
+      <label>R2（read 2, FASTQ.gz）</label>
+      <input type="file" name="R2" accept=".gz,.fastq.gz,.fq.gz" required>
+      <label>I1（i7 index read, FASTQ.gz）</label>
+      <input type="file" name="I1" accept=".gz,.fastq.gz,.fq.gz" required>
+      <label>I2（i5 index read, FASTQ.gz）</label>
+      <input type="file" name="I2" accept=".gz,.fastq.gz,.fq.gz" required>
+      <label>样本表 CSV（表头 sample_id,i7,i5）</label>
+      <input type="file" name="sample_sheet" accept=".csv" required>
+      <p class="hint">索引等长且组合唯一；i5 需为匹配方向。两端各允许 1 个字符差异，并列最优进 undetermined。</p>
+      <button class="primary" type="submit" id="submitBtn">启动作业</button>
+    </form>
+    <div id="formMsg"></div>
+  </section>
+
+  <section class="card">
+    <h2>作业列表 <span style="font-weight:400;color:var(--muted)">（每 2 秒自动刷新）</span></h2>
+    <table>
+      <thead>
+        <tr><th>作业 ID</th><th>状态</th><th>进度 / 分配数</th><th>操作</th></tr>
+      </thead>
+      <tbody id="jobRows">
+        <tr><td colspan="4" class="empty">暂无作业</td></tr>
+      </tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const form = document.getElementById('jobForm');
+const formMsg = document.getElementById('formMsg');
+const submitBtn = document.getElementById('submitBtn');
+const jobRows = document.getElementById('jobRows');
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function shortId(id) { return id.slice(0, 8); }
+
+function countsText(job) {
+  if (job.status === 'running') {
+    return `<div class="counts">已处理 ${job.total_reads} 条 · 未分配 ${job.unassigned}</div>`;
+  }
+  if (job.final_counts) {
+    const parts = Object.entries(job.final_counts)
+      .map(([k, v]) => `${esc(k)}=${v}`).join(', ');
+    return `<div class="counts">共 ${job.total_reads} 条</div>
+            <div class="counts mono">${parts}</div>`;
+  }
+  return '<div class="counts">-</div>';
+}
+
+function render(jobs) {
+  if (!jobs.length) {
+    jobRows.innerHTML = '<tr><td colspan="4" class="empty">暂无作业</td></tr>';
+    return;
+  }
+  jobRows.innerHTML = jobs.map(job => {
+    const actions = [];
+    if (job.status === 'running') {
+      actions.push(`<button class="danger" onclick="cancelJob('${job.id}', this)">取消</button>`);
+    }
+    if (job.download_available) {
+      actions.push(`<button class="download" onclick="location.href='/api/jobs/${job.id}/download'">下载 ZIP</button>`);
+    }
+    const errLine = job.error ? `<div class="error">${esc(job.error)}</div>` : '';
+    return `<tr>
+      <td class="mono">${shortId(job.id)}<br>
+        <span style="color:var(--muted)">${esc((job.upload_names['samples.csv']) || '')}</span></td>
+      <td><span class="badge ${job.status}">${job.status}</span>${errLine}</td>
+      <td>${countsText(job)}</td>
+      <td>${actions.join(' ') || '<span style="color:var(--muted)">-</span>'}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function refresh() {
+  try {
+    const resp = await fetch('/api/jobs');
+    const data = await resp.json();
+    render(data.jobs);
+  } catch (e) { /* keep last rendered state */ }
+}
+
+form.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  submitBtn.disabled = true;
+  formMsg.textContent = '上传中…';
+  formMsg.style.color = 'var(--muted)';
+  try {
+    const fd = new FormData(form);
+    const resp = await fetch('/api/jobs', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (!resp.ok) {
+      formMsg.textContent = `被拒绝：${data.detail || resp.status}`;
+      formMsg.style.color = 'var(--red)';
+    } else {
+      formMsg.textContent = `作业 ${shortId(data.id)} 已启动`;
+      formMsg.style.color = 'var(--green)';
+      form.reset();
+    }
+  } catch (e) {
+    formMsg.textContent = `请求失败：${e}`;
+    formMsg.style.color = 'var(--red)';
+  } finally {
+    submitBtn.disabled = false;
+    refresh();
+  }
+});
+
+window.cancelJob = async function(id, btn) {
+  btn.disabled = true;
+  btn.textContent = '取消中…';
+  try {
+    const resp = await fetch(`/api/jobs/${id}/cancel`, { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) { alert(data.detail || '取消失败'); btn.disabled = false; btn.textContent = '取消'; }
+  } catch (e) { alert(`取消失败：${e}`); btn.disabled = false; btn.textContent = '取消'; }
+  refresh();
+};
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
